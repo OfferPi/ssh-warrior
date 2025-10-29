@@ -33,7 +33,7 @@ Each host gets a unique, consistent color — making it easy to instantly see *w
 
    ```sh
    git clone https://github.com/OfferPi/ssh-warrior.git ${ZSH_CUSTOM:-~/.oh-my-zsh/custom}/plugins/ssh-warrior
-````
+   ````
 
 2. **Enable the plugin:**
 
