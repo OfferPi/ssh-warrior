@@ -1,17 +1,32 @@
-# ~/.oh-my-zsh/custom/plugins/ssh-host-bg/ssh-host-bg.plugin.zsh
-# Per-host SSH background color via OSC 11. Restores on exit.
-# - Hue seeded from hostname; S=0.65, L=0.20 (fixed).
-# - Works with plain `ssh`, `user@host`, options, IPv6 [addr], etc.
-# - On exit: try OSC 111 reset, then force a fallback base color.
+# ssh-warrior.plugin.zsh
+# Per-host SSH background color via OSC 11.
+# - Stable color from hostname (hash → hue).
+# - Defaults: S=0.65, L=0.20 (20% lightness as requested).
+# - Works with normal `ssh` (if SSH_WARRIOR_WRAP=1) and via `ssh-warrior`.
+# - Restores on exit using OSC 111 then a base fallback color.
 
-# Toggle off (skip coloring):
-#   export SSH_BG_DISABLE=1
-#
-# Fallback base background (HEX without '#') used on exit:
-: ${SSH_BG_FALLBACK_DEFAULT:=171421}
+# =========================
+# Configuration (env vars)
+# =========================
+: ${SSH_WARRIOR_DISABLE:=0}           # 1 to disable all behavior
+: ${SSH_WARRIOR_WRAP:=1}              # 1 to wrap the builtin `ssh`, 0 to leave `ssh` alone
+: ${SSH_WARRIOR_DEBUG:=0}             # 1 to echo debug info
+: ${SSH_WARRIOR_BASE_HEX:=171421}     # fallback base color (HEX w/o '#') used on exit
+: ${SSH_WARRIOR_SATURATION:=0.65}     # saturation [0..1]
+: ${SSH_WARRIOR_LIGHTNESS:=0.20}      # lightness [0..1] (keep at 0.20 for your requirement)
+: ${SSH_WARRIOR_RESET_STRATEGY:=auto} # auto | base_only
+                                      #  - auto: try OSC 111, then force BASE_HEX
+                                      #  - base_only: skip OSC 111; set BASE_HEX directly
+: ${SSH_WARRIOR_HASH_CMD:=cksum}      # cksum | poly (fallback polynomial hash)
+: ${SSH_WARRIOR_ENABLE_SSH_WARRIOR:=1} # 1 to define `ssh-warrior` helper command
+
+# =========================
+# Internals
+# =========================
+_sshwarrior_dbg() { (( SSH_WARRIOR_DEBUG )) && print -r -- "[ssh-warrior] $*"; }
 
 # --- HSL → RGB (0–255) helper (H in [0,360), S,L in [0,1]) ---
-_sshbg_hsl_to_hex() {
+_sshwarrior_hsl_to_hex() {
   local -F h=$1 s=$2 l=$3
   local -F c x m r1=0 g1=0 b1=0 r g b hp mod2 tminus1 abs_tminus1
 
@@ -62,11 +77,12 @@ _sshbg_hsl_to_hex() {
 }
 
 # --- Hostname → Hue in [0,360) ---
-_sshbg_hue_from_host() {
+_sshwarrior_hue_from_host() {
   local host="$1" num
-  if command -v cksum >/dev/null 2>&1; then
+  if [[ "$SSH_WARRIOR_HASH_CMD" == "cksum" ]] && command -v cksum >/dev/null 2>&1; then
     num=$(print -n -- "$host" | cksum | awk '{print $1}')
   else
+    # polynomial fallback
     local -i h=0 i ch
     for (( i=1; i<=${#host}; i++ )); do
       ch=$(printf "%d" "'${host[i]}")
@@ -77,32 +93,40 @@ _sshbg_hue_from_host() {
   echo $(( num % 360 ))
 }
 
-# --- Build HEX from hostname, S=0.65, L=0.20 ---
-_sshbg_hex_from_host() {
+# --- Build HEX from hostname, using configured S and L ---
+_sshwarrior_hex_from_host() {
   local host="$1"
-  local -F s=0.65 l=0.20
-  local h=$(_sshbg_hue_from_host "$host")
-  _sshbg_hsl_to_hex "$h" "$s" "$l"
+  local -F s=$SSH_WARRIOR_SATURATION
+  local -F l=$SSH_WARRIOR_LIGHTNESS
+  local h=$(_sshwarrior_hue_from_host "$host")
+  _sshwarrior_hsl_to_hex "$h" "$s" "$l"
 }
 
 # --- OSC 11 set background ---
-_sshbg_set_bg() {
+_sshwarrior_set_bg() {
   local hex="$1"
   print -n -- "\033]11;#${hex}\007"
+  _sshwarrior_dbg "set bg #$hex"
 }
 
-# --- Reset background: try OSC 111, then force fallback base ---
-_sshbg_reset_bg() {
-  # Try terminal default
-  print -n -- "\033]111\007"
-  # Ensure a clean restore even if OSC 111 is ignored
-  if [[ -n "$SSH_BG_FALLBACK_DEFAULT" ]]; then
-    print -n -- "\033]11;#${SSH_BG_FALLBACK_DEFAULT}\007"
-  fi
+# --- Reset background based on strategy ---
+_sshwarrior_reset_bg() {
+  case "$SSH_WARRIOR_RESET_STRATEGY" in
+    base_only)
+      print -n -- "\033]11;#${SSH_WARRIOR_BASE_HEX}\007"
+      _sshwarrior_dbg "reset: base_only #$SSH_WARRIOR_BASE_HEX"
+      ;;
+    auto|*)
+      # Try OSC 111 (reset to terminal default) then enforce fallback base
+      print -n -- "\033]111\007"
+      print -n -- "\033]11;#${SSH_WARRIOR_BASE_HEX}\007"
+      _sshwarrior_dbg "reset: osc111 + base #$SSH_WARRIOR_BASE_HEX"
+      ;;
+  esac
 }
 
 # --- Parse ssh dest (handles user@host, [ipv6], options) ---
-_sshbg_parse_host() {
+_sshwarrior_parse_host() {
   local argv=("$@")
   local dest="" a
   local i=1
@@ -156,26 +180,43 @@ _sshbg_parse_host() {
   print -r -- "$dest"
 }
 
-# --- ssh wrapper ---
-ssh() {
-  if [[ -n "$SSH_BG_DISABLE" ]]; then
+# --- Core runner used by both wrappers ---
+_sshwarrior_run() {
+  if (( SSH_WARRIOR_DISABLE )); then
     command ssh "$@"
     return $?
   fi
 
   local host hex _ssh_exit
-  host=$(_sshbg_parse_host "$@") || {
+  host=$(_sshwarrior_parse_host "$@") || {
     command ssh "$@"
     return $?
   }
 
-  hex=$(_sshbg_hex_from_host "$host")
-  _sshbg_set_bg "$hex"
+  hex=$(_sshwarrior_hex_from_host "$host")
+  _sshwarrior_set_bg "$hex"
 
   command ssh "$@"
   _ssh_exit=$?
 
-  _sshbg_reset_bg
+  _sshwarrior_reset_bg
   return $_ssh_exit
+}
+
+# --- Public command: ssh-warrior (always uses the plugin logic) ---
+if (( SSH_WARRIOR_ENABLE_SSH_WARRIOR )); then
+  ssh-warrior() { _sshwarrior_run "$@"; }
+fi
+
+# --- Optional: wrap normal `ssh` (default on) ---
+if (( SSH_WARRIOR_WRAP )); then
+  ssh() { _sshwarrior_run "$@"; }
+fi
+
+# --- Optional: quick preview helper ---
+ssh-warrior-preview() {
+  local host="${1:-example}"
+  local hex=$(_sshwarrior_hex_from_host "$host")
+  print -r -- "$host → #$hex  (S=$SSH_WARRIOR_SATURATION L=$SSH_WARRIOR_LIGHTNESS)"
 }
 
